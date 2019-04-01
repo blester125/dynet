@@ -8,7 +8,11 @@ from itertools import chain
 import dynet as dy
 import numpy as np
 from crf import CRF
-from utils import read_conll, read_glove, Vocab, batch, f1, get_logger, create_conll_file
+from utils import (
+    read_conll, read_glove,
+    Vocab, batch, f1, get_logger,
+    create_conll_file
+)
 
 logger = get_logger('tagger')
 
@@ -16,6 +20,8 @@ logger = get_logger('tagger')
 parser = argparse.ArgumentParser("A Tagger in Dynet")
 parser.add_argument('--ner', '-n', default='ner')
 parser.add_argument('--glove', '-g', default='glove')
+parser.add_argument('--senna', '-s', default='.')
+parser.add_argument('--debug', action='store_true')
 args = parser.parse_known_args()[0]
 
 # Process input
@@ -23,6 +29,7 @@ train = os.path.join(args.ner, 'eng.train')
 dev = os.path.join(args.ner, 'eng.testa')
 test = os.path.join(args.ner, 'eng.testb')
 glove = os.path.join(args.glove, 'glove.6B.100d.txt')
+senna = os.path.join(args.senna, 'senna-50.txt')
 
 # Read data
 train_text, train_labels = read_conll(train)
@@ -47,7 +54,7 @@ n_tags = len(l_vocab)
 unif = 0.1
 cdsz = 30
 cscale = math.sqrt(3 / float(cdsz))
-dsz = 100
+dsz = 100 + 50
 filtsz = [3]
 cmotsz = 30
 rnninsz = dsz + (cmotsz * len(filtsz))
@@ -70,6 +77,9 @@ dev_every = 700
 vectors = None
 if os.path.exists(glove):
     vectors = read_glove(glove, vocab, unif=unif)
+    if os.path.exists(senna):
+        new_vectors = read_glove(senna, vocab, unif=unif, dsz=50)
+        vectors = np.concatenate([vectors, new_vectors], axis=1)
 
 # Model
 pc = dy.ParameterCollection()
@@ -93,41 +103,7 @@ convs = [conv.add_parameters((1, fsz, cdsz, cmotsz), name="w-%d" % fsz) for fsz 
 convs_bias = [conv.add_parameters(cmotsz, init=dy.ConstInitializer(0), name="b-%d" % fsz) for fsz in filtsz]
 
 # LSTM
-# blstm = dy.BiRNNBuilder(rnn_layers, rnninsz, brnnsz, pc, dy.LSTMBuilder)
-
-class SumLSTM(object):
-    def __init__(self, layers, isz, osz, pc):
-        self._pc = pc.add_subcollection("sum-lstm")
-        self.layers = layers
-        self.isz = isz
-        self.osz = osz
-        self.W_x = self._pc.add_parameters((osz * 3, isz), name="weight-x")
-        self.W_h = self._pc.add_parameters((osz * 2, osz), name="weight-h")
-        self.b = self._pc.add_parameters((osz * 2), name="bias")
-
-    def transduce(self, xs):
-        osz = self.osz
-        hs = []
-        h_prev = dy.zeros((osz))
-        c_prev = dy.zeros((osz))
-        for x in xs:
-            gate_h = self.W_h * h_prev
-            gate_x = self.W_x * x
-            c = dy.pickrange(gate_x, osz * 2, osz * 3)
-            gate_x = dy.pickrange(gate_x, 0, osz * 2)
-            gates = dy.logistic(gate_x + gate_h + self.b)
-            i = dy.pickrange(gates, 0, osz)
-            f = dy.pickrange(gates, osz, osz * 2)
-            c_prev = dy.cmult(i, c) + dy.cmult(f, c_prev)
-            h_prev = dy.tanh(c_prev)
-            hs.append(h_prev)
-        return hs
-
-    def __str__(self):
-        return "\n".join([f"{p.name()}: {p.shape()}" for p in self._pc.parameters_list()])
-
-f_lstm = SumLSTM(rnn_layers, rnninsz, rnnsz, pc)
-b_lstm = SumLSTM(rnn_layers, rnninsz, rnnsz, pc)
+blstm = dy.BiRNNBuilder(rnn_layers, rnninsz, brnnsz, pc, dy.LSTMBuilder)
 
 # Output Projection
 proj = pc.add_subcollection(name="output")
@@ -137,11 +113,13 @@ b = proj.add_parameters(n_tags, init=dy.ConstInitializer(0), name="bias")
 # CRF
 crf = CRF(n_tags, l_vocab, pc)
 
+
 def variational_dropout(input_, dropout):
     """Apply the same dropout mask to each step in a sequence."""
     pkeep = 1 - dropout
     mask = dy.random_bernoulli(input_[0].dim()[0], pkeep, (1 / pkeep))
     return [dy.cmult(inp, mask) for inp in input_]
+
 
 def char_comp(word, train=True):
     """Create a representation base on character composition with a Conv net."""
@@ -155,13 +133,16 @@ def char_comp(word, train=True):
     for conv, bias in zip(convs, convs_bias):
         out = dy.tanh(dy.conv2d_bias(c_embed, conv, bias, strides, is_valid=False))
         logger.debug("Char Conv Shape: %s" % (out.dim(),))
-        mot = dy.reshape(dy.max_dim(out, d=1), (cmotsz,))
+        ((_, seq_len, _), _) = out.dim()
+        pooled = dy.maxpooling2d(out, [1, seq_len, 1], strides)
+        mot = dy.reshape(pooled, (cmotsz,))
         mots.append(mot)
     mot = dy.concatenate(mots)
     if train:
         mot = dy.dropout(mot, dropout)
     logger.debug("Max Overtime Shape: %s" % (mot.dim(),))
     return mot
+
 
 def forward_emission(input_, train=True):
     """Calculate forward to produce emission probabilities."""
@@ -172,17 +153,16 @@ def forward_emission(input_, train=True):
     word_embed = [WEmbed[vocab[x]] for x in input_]
     inputs_ = [dy.concatenate([c, w]) for c, w in zip(char_embed, word_embed)]
     logger.debug("Input Shape: %s" % (inputs_[0].dim(),))
-    # lstm_out = blstm.transduce(inputs_)
-    f_out = f_lstm.transduce(inputs_)
-    b_out = b_lstm.transduce(reversed(inputs_))
-    lstm_out = [dy.concatenate([f, b]) for f, b in zip(f_out, reversed(b_out))]
+    lstm_out = blstm.transduce(inputs_)
 
     if train:
         lstm_out = variational_dropout(lstm_out, dropout)
+
     logger.debug("LSTM Shape: %s" % (lstm_out[0].dim(),))
     emissions = [dy.affine_transform([b, W, x]) for x in lstm_out]
     logger.debug("Emission Shape: %s" % (emissions[0].dim(),))
     return emissions
+
 
 def calc_loss(input_, tags):
     """Calculate the CRF loss of a sample."""
@@ -190,9 +170,9 @@ def calc_loss(input_, tags):
     emissions = forward_emission(input_)
     return crf.neg_log_loss(emissions, tags)
 
+
 def evaluate_loss(text, labels, set_):
     """Calculate the average loss on the dev/test set."""
-
     losses = []
     for t, l in zip(text, labels):
         l = [l_vocab[tag] for tag in l]
@@ -200,6 +180,7 @@ def evaluate_loss(text, labels, set_):
         losses.append(crf.neg_log_loss(emissions, l))
     res = dy.esum(losses).npvalue() / len(text)
     logger.info("%s Loss: %f" % (set_, res))
+
 
 def predict(text):
     preds = []
@@ -209,6 +190,7 @@ def predict(text):
         tags, s1 = crf.decode(emissions)
         preds.append([l_vocab.i2w[tag] for tag in tags])
     return preds
+
 
 def evaluate(text, labels, set_):
     """Calculate F1 on the dev/test set."""
@@ -227,10 +209,9 @@ logger.info('\n'.join(model_str))
 model_file = 'tagger.model'
 result_file = 'results.conll'
 
-# trainer = dy.MomentumSGDTrainer(pc, learning_rate=eta, mom=mom)
-trainer = dy.SimpleSGDTrainer(pc, learning_rate=eta)
+trainer = dy.MomentumSGDTrainer(pc, learning_rate=eta, mom=mom)
 trainer.set_clip_threshold(clip)
-# trainer.set_sparse_updates(False)
+trainer.set_sparse_updates(False)
 
 best_score = 0
 last_best = 0
@@ -240,8 +221,8 @@ train = batch(train_text, train_labels, batch_size)
 for epoch in range(epochs):
     logger.info("Epoch: %d" % epoch)
     random.shuffle(train)
-    trainer.learning_rate = eta / (1 + decay * epoch)
-    logger.info("Learning rate: %f" % trainer.learning_rate)
+    # trainer.learning_rate = eta / (1 + decay * epoch)
+    # logger.info("Learning rate: %f" % trainer.learning_rate)
     total_loss = 0
     for i, batch in enumerate(train):
         dy.renew_cg()

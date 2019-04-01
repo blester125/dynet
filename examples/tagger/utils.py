@@ -4,6 +4,7 @@ from itertools import chain
 from collections import defaultdict
 import numpy as np
 
+
 def get_logger(name, level=None):
     """Create a logger that can get level from env variable."""
     logger = logging.getLogger(name)
@@ -17,7 +18,9 @@ def get_logger(name, level=None):
     logger.addHandler(sh)
     return logger
 
+
 logger = get_logger('eval', 'WARN')
+
 
 def read_glove(file_name, vocab, unif=0.25, dsz=100):
     """Read vectors from file and initialize unknown vectors to random uniform."""
@@ -33,6 +36,7 @@ def read_glove(file_name, vocab, unif=0.25, dsz=100):
             if word in vocab:
                 vectors[vocab[word], :] = np.array([float(x) for x in parts])
     return vectors
+
 
 def convert_BIO(seq):
     """Convert an IOB sequence to IOB2 (BIO)."""
@@ -57,6 +61,7 @@ def convert_BIO(seq):
             new_seq.append(token)
         prev = token
     return new_seq
+
 
 def read_conll(file_name, convert=convert_BIO):
     """Read dataset from a CONLL file and convert to BIO while skipping the DOCSTART lines."""
@@ -90,6 +95,7 @@ def batch(text, labels, bsz=10):
     zipped = sorted(zipped, key=lambda x: len(x[0]))
     batched = [zipped[x:x+bsz] for x in range(0, len(zipped), bsz)]
     return batched
+
 
 class Vocab(object):
     """Vocab with options so that it is easy to use with words and characters."""
@@ -134,6 +140,7 @@ class Vocab(object):
     def __contains__(self, item):
         return item in self.w2i
 
+
 def f1(gold, preds):
     """Calculate entity level F1 on a list of sequences."""
     correct_count = 0
@@ -153,6 +160,7 @@ def f1(gold, preds):
         return 0.0
     f = (2 * p * r) / (p + r)
     return f
+
 
 def to_entities(labels):
     """Convert a sequence of labels in BIO to entities."""
@@ -193,6 +201,7 @@ def to_entities(labels):
     if type_ is not None:
         entities.append((type_, start, i + 1))
     return entities
+
 
 def create_conll_file(text, preds, golds, file_name="results.conll"):
     with open(file_name, 'w') as f:

@@ -54,6 +54,18 @@ if [ ! -e $GLOVEFILE ]; then
     unzip -qq $GLOVEZIP -d $GLOVEDIR
 fi
 
+SENNAURL="https://www.dropbox.com/s/s8q2feew1fmwl3p/senna-50.txt.gz?dl=1"
+SENNAZIP="senna-50.txt.gz"
+SENNAFILE="senna-50.txt"
+
+if [ ! -e $SENNAFILE ]; then
+    echo "Getting Glove data..."
+    if [ ! -e $SENNAZIP ]; then
+        wget -O $SENNAZIP --quiet $SENNAURL
+    fi
+    gunzip $SENNAZIP > $SENNAFILE
+fi
+
 CONLLEVALURL="http://deeplearning.net/tutorial/code/conlleval.pl"
 CONLLEVAL="conlleval.pl"
 
